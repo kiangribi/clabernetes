@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	clabernetesapisv1alpha1 "github.com/clabernetes/clabernetes/apis/v1alpha1"
 	clabernetesconstants "github.com/clabernetes/clabernetes/constants"
@@ -194,13 +195,20 @@ func compileAcceptedInterfaces(
 			if connectivity == connectivityWire {
 				peerTransport = FabricServiceName(endpoints[peerSide].NodeName)
 			}
+			netem, err := endpointNetem(
+				fmt.Sprintf("links.%s.spec.endpoint%c.netem", link.GetName(), 'A'+rune(side)),
+				endpoints[side].Netem,
+			)
+			if err != nil {
+				return nil, err
+			}
 			result = append(result, clabernetesinternaldeviceplan.InterfaceInput{
 				ID:     fmt.Sprintf("%s/%c", link.GetUID(), 'a'+rune(side)),
 				NodeID: memberIDs[member.GetName()], Name: endpoints[side].InterfaceName,
 				LinkID: string(link.GetUID()), LinkName: link.GetName(), PeerNodeID: peerNodeID,
 				PeerInterface: endpoints[peerSide].InterfaceName,
 				PeerTransport: peerTransport, Connectivity: connectivity,
-				WireID: link.Status.WireID, MTU: link.Spec.MTU,
+				WireID: link.Status.WireID, MTU: link.Spec.MTU, Netem: netem,
 			})
 		}
 	}
@@ -209,6 +217,50 @@ func compileAcceptedInterfaces(
 	})
 
 	return result, nil
+}
+
+// endpointNetem resolves the Link API impairment of one endpoint into its plan form. Admission
+// already validated the durations, so a value that does not parse is a stale or bypassed object.
+func endpointNetem(
+	field string,
+	netem *clabernetesapisv1alpha1.LinkNetemSpec,
+) (*clabernetesinternaldeviceplan.Netem, error) {
+	if netem == nil {
+		return nil, nil //nolint:nilnil // an endpoint without an impairment is unimpaired.
+	}
+
+	resolved := &clabernetesinternaldeviceplan.Netem{
+		Loss: netem.Loss, Rate: netem.Rate, Corruption: netem.Corruption,
+	}
+
+	for _, duration := range []struct {
+		name   string
+		value  string
+		target *time.Duration
+	}{
+		{name: "delay", value: netem.Delay, target: &resolved.Delay},
+		{name: "jitter", value: netem.Jitter, target: &resolved.Jitter},
+	} {
+		if duration.value == "" {
+			continue
+		}
+		parsed, err := time.ParseDuration(duration.value)
+		if err != nil {
+			return nil, planInputError(
+				clabernetesinternaldeviceplan.ErrorInvalidInput,
+				field+"."+duration.name,
+				"netem "+duration.name+" is not a duration",
+			)
+		}
+		*duration.target = parsed
+	}
+
+	// An impairment without any set field leaves the interface unimpaired, the same as none.
+	if *resolved == (clabernetesinternaldeviceplan.Netem{}) {
+		return nil, nil //nolint:nilnil // an impairment without set fields is no impairment.
+	}
+
+	return resolved, nil
 }
 
 func validateResolvedEndpoint(

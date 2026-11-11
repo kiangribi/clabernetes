@@ -1392,6 +1392,7 @@ func appendInterfacePlans(
 			Connectivity:     intf.Input.Connectivity,
 			WireID:           intf.Input.WireID,
 			MTU:              intf.Input.MTU,
+			Netem:            intf.Input.Netem,
 			LinkApplyMode:    node.LinkApplyMode,
 			RequiredAtStart:  true,
 		})

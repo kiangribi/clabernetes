@@ -6,9 +6,23 @@ package compiler
 
 import (
 	"fmt"
+	"math"
 	"strings"
+	"time"
 
+	clabernetesapisv1alpha1 "github.com/clabernetes/clabernetes/apis/v1alpha1"
 	yamlv3 "gopkg.in/yaml.v3"
+)
+
+// Bounds of a link impairment, the same the Link API enforces: the connectivity sidecar programs
+// the delay in 32-bit kernel ticks, the kernel caps the jitter at 2^31-1 ns, and the rate in
+// kbit/s must convert to bytes/s within 64 bits.
+const (
+	invalidLinkNetemCode = "invalid-link-netem"
+
+	maxNetemDelay  = 4 * time.Minute
+	maxNetemJitter = math.MaxInt32 * time.Nanosecond
+	maxNetemRate   = math.MaxUint64 / 1000
 )
 
 // linkDefinition represents a link definition in the topology file. It accepts both
@@ -26,18 +40,36 @@ type linkConfig struct {
 	Labels    map[string]string `yaml:"labels,omitempty"`
 	Vars      map[string]any    `yaml:"vars,omitempty"`
 	MTU       int               `yaml:"mtu,omitempty"`
+	// Netem is the brief link form of the endpoint impairments, in the order of the endpoints.
+	Netem []*netemDefinition `yaml:"netem,omitempty"`
+}
+
+// netemDefinition is the link impairment of one endpoint in containerlab's topology vocabulary.
+type netemDefinition struct {
+	Delay      string  `yaml:"delay,omitempty"`
+	Jitter     string  `yaml:"jitter,omitempty"`
+	Loss       float64 `yaml:"loss,omitempty"`
+	Rate       uint64  `yaml:"rate,omitempty"`
+	Corruption float64 `yaml:"corruption,omitempty"`
 }
 
 // linkEndpoints stores the canonical brief endpoint form, because that is the complete endpoint
-// vocabulary the c9s Link API can represent.
-type linkEndpoints []string
+// vocabulary the c9s Link API can represent. The impairment a structured endpoint declares is
+// kept beside it, in the same order.
+type linkEndpoints struct {
+	names []string
+	netem []*netemDefinition
+}
 
 func (e *linkEndpoints) UnmarshalYAML(value *yamlv3.Node) error {
 	if value.Kind != yamlv3.SequenceNode {
 		return fmt.Errorf("%w: link endpoints must be a sequence", errParse)
 	}
 
-	endpoints := make(linkEndpoints, 0, len(value.Content))
+	endpoints := linkEndpoints{
+		names: make([]string, 0, len(value.Content)),
+		netem: make([]*netemDefinition, 0, len(value.Content)),
+	}
 
 	for _, endpointNode := range value.Content {
 		switch endpointNode.Kind {
@@ -47,11 +79,13 @@ func (e *linkEndpoints) UnmarshalYAML(value *yamlv3.Node) error {
 				return err
 			}
 
-			endpoints = append(endpoints, endpoint)
+			endpoints.names = append(endpoints.names, endpoint)
+			endpoints.netem = append(endpoints.netem, nil)
 		case yamlv3.MappingNode:
 			endpoint := struct {
-				Node      string `yaml:"node"`
-				Interface string `yaml:"interface"`
+				Node      string           `yaml:"node"`
+				Interface string           `yaml:"interface"`
+				Netem     *netemDefinition `yaml:"netem"`
 			}{}
 
 			err := endpointNode.Decode(&endpoint)
@@ -75,7 +109,8 @@ func (e *linkEndpoints) UnmarshalYAML(value *yamlv3.Node) error {
 				return err
 			}
 
-			endpoints = append(endpoints, canonical)
+			endpoints.names = append(endpoints.names, canonical)
+			endpoints.netem = append(endpoints.netem, endpoint.Netem)
 		case yamlv3.DocumentNode, yamlv3.SequenceNode, yamlv3.AliasNode:
 			return fmt.Errorf(
 				"%w: link endpoint must be a string or node/interface mapping",
@@ -167,25 +202,32 @@ func compileContainerlabLinks( //nolint:gocyclo
 			continue
 		}
 
-		if len(link.Endpoints) != linkEndpointElementCount {
+		if len(link.Endpoints.names) != linkEndpointElementCount {
 			return nil, fmt.Errorf(
 				"%w: endpoint '%q' has wrong syntax, unexpected number of items",
 				errParse,
-				[]string(link.Endpoints),
+				link.Endpoints.names,
 			)
 		}
 
-		endpointAParts := strings.Split(link.Endpoints[0], ":")
-		endpointBParts := strings.Split(link.Endpoints[1], ":")
+		endpointAParts := strings.Split(link.Endpoints.names[0], ":")
+		endpointBParts := strings.Split(link.Endpoints.names[1], ":")
 
 		if len(endpointAParts) != linkEndpointElementCount ||
 			len(endpointBParts) != linkEndpointElementCount {
 			return nil, fmt.Errorf(
 				"%w: endpoint '%q' has wrong syntax, bad node:interface config",
 				errParse,
-				[]string(link.Endpoints),
+				link.Endpoints.names,
 			)
 		}
+
+		netem, invalidNetem := compileLinkNetem(
+			link,
+			linkPath,
+			[2]string{endpointAParts[0], endpointBParts[0]},
+			diagnostics,
+		)
 
 		invalidEndpoint := false
 
@@ -233,7 +275,7 @@ func compileContainerlabLinks( //nolint:gocyclo
 			invalidEndpoint = true
 		}
 
-		if invalidEndpoint {
+		if invalidEndpoint || invalidNetem {
 			continue
 		}
 
@@ -241,16 +283,154 @@ func compileContainerlabLinks( //nolint:gocyclo
 			EndpointA: Endpoint{
 				NodeName:      endpointAParts[0],
 				InterfaceName: endpointAParts[1],
+				Netem:         netem[0],
 			},
 			EndpointB: Endpoint{
 				NodeName:      endpointBParts[0],
 				InterfaceName: endpointBParts[1],
+				Netem:         netem[1],
 			},
 			MTU: link.MTU,
 		})
 	}
 
 	return links, nil
+}
+
+// compileLinkNetem resolves the impairment of each endpoint, from the endpoint itself or from
+// the brief link's netem list, into the Link API form. It reports a diagnostic and true for an
+// impairment the Link API would reject, so the whole topology fails with a precise path rather
+// than one rejected Link.
+func compileLinkNetem(
+	link *linkDefinition,
+	linkPath string,
+	nodeNames [2]string,
+	diagnostics *compileDiagnostics,
+) ([2]*clabernetesapisv1alpha1.LinkNetemSpec, bool) {
+	resolved := [2]*clabernetesapisv1alpha1.LinkNetemSpec{}
+
+	if len(link.Netem) > linkEndpointElementCount {
+		diagnostics.add(Diagnostic{
+			Code:    invalidLinkNetemCode,
+			Path:    linkPath + ".netem",
+			Message: "the number of netem entries exceeds the number of endpoints",
+		})
+
+		return resolved, true
+	}
+
+	invalid := false
+
+	for side := range resolved {
+		definition := link.Endpoints.netem[side]
+		path := fmt.Sprintf("%s.endpoints[%d].netem", linkPath, side)
+
+		if side < len(link.Netem) && link.Netem[side] != nil {
+			if definition != nil {
+				diagnostics.add(Diagnostic{
+					Code:    invalidLinkNetemCode,
+					Path:    path,
+					Message: "the endpoint and the link's netem list both set this impairment",
+				})
+
+				invalid = true
+
+				continue
+			}
+
+			definition = link.Netem[side]
+			path = fmt.Sprintf("%s.netem[%d]", linkPath, side)
+		}
+
+		if definition == nil {
+			continue
+		}
+
+		if nodeNames[side] == LinkHostNodeName {
+			diagnostics.add(Diagnostic{
+				Code:    invalidLinkNetemCode,
+				Path:    path,
+				Message: "a host endpoint cannot be impaired, impair the node endpoint instead",
+			})
+
+			invalid = true
+
+			continue
+		}
+
+		netem, message := compileNetem(definition)
+		if message != "" {
+			diagnostics.add(Diagnostic{Code: invalidLinkNetemCode, Path: path, Message: message})
+
+			invalid = true
+
+			continue
+		}
+
+		resolved[side] = netem
+	}
+
+	return resolved, invalid
+}
+
+// compileNetem validates one impairment with the bounds the Link API enforces and returns it in
+// the API form, or the reason it is invalid. An impairment without any set field is nil.
+func compileNetem(
+	definition *netemDefinition,
+) (*clabernetesapisv1alpha1.LinkNetemSpec, string) {
+	durations := map[string]time.Duration{}
+
+	for _, field := range []struct {
+		name    string
+		value   string
+		maximum time.Duration
+	}{
+		{name: "delay", value: definition.Delay, maximum: maxNetemDelay},
+		{name: "jitter", value: definition.Jitter, maximum: maxNetemJitter},
+	} {
+		if field.value == "" {
+			continue
+		}
+
+		duration, err := time.ParseDuration(field.value)
+		if err != nil || duration < 0 {
+			return nil, fmt.Sprintf(
+				"netem %s %q is not a duration, e.g. 100ms",
+				field.name,
+				field.value,
+			)
+		}
+
+		if duration > field.maximum {
+			return nil, fmt.Sprintf("netem %s must be at most %s", field.name, field.maximum)
+		}
+
+		durations[field.name] = duration
+	}
+
+	switch {
+	case durations["jitter"] != 0 && durations["delay"] == 0:
+		return nil, "netem jitter cannot be set without setting delay"
+	// written this way, NaN is out of range too
+	case !(definition.Loss >= 0 && definition.Loss <= 100):
+		return nil, "netem loss must be in the range between 0 and 100"
+	case !(definition.Corruption >= 0 && definition.Corruption <= 100):
+		return nil, "netem corruption must be in the range between 0 and 100"
+	case definition.Rate > maxNetemRate:
+		return nil, fmt.Sprintf("netem rate must be at most %d kbit/s", uint64(maxNetemRate))
+	}
+
+	if *definition == (netemDefinition{}) {
+		return nil, ""
+	}
+
+	return &clabernetesapisv1alpha1.LinkNetemSpec{
+		Delay:      definition.Delay,
+		Jitter:     definition.Jitter,
+		Loss:       definition.Loss,
+		Rate:       int64(definition.Rate),
+		Corruption: definition.Corruption,
+	}, ""
 }
 
 func unsupportedContainerlabLinkTypeDiagnostic(linkType, linkPath string) Diagnostic {

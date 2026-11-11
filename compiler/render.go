@@ -655,6 +655,16 @@ func renderLinks(
 			return nil, err
 		}
 
+		endpointA, err := renderLinkEndpoint(compiledLink.EndpointA)
+		if err != nil {
+			return nil, err
+		}
+
+		endpointB, err := renderLinkEndpoint(compiledLink.EndpointB)
+		if err != nil {
+			return nil, err
+		}
+
 		links = append(links, unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": c9sAPIVersion,
 			"kind":       linkKind,
@@ -663,20 +673,33 @@ func renderLinks(
 				LinkResourceName(compiledLink.EndpointA, compiledLink.EndpointB),
 			),
 			"spec": map[string]any{
-				"endpointA": map[string]any{
-					"nodeName":      compiledLink.EndpointA.NodeName,
-					"interfaceName": compiledLink.EndpointA.InterfaceName,
-				},
-				"endpointB": map[string]any{
-					"nodeName":      compiledLink.EndpointB.NodeName,
-					"interfaceName": compiledLink.EndpointB.InterfaceName,
-				},
-				"mtu": mtu,
+				"endpointA": endpointA,
+				"endpointB": endpointB,
+				"mtu":       mtu,
 			},
 		}})
 	}
 
 	return links, nil
+}
+
+// renderLinkEndpoint renders one side of a Link, with its impairment only when it has one.
+func renderLinkEndpoint(endpoint Endpoint) (map[string]any, error) {
+	rendered := map[string]any{
+		"nodeName":      endpoint.NodeName,
+		"interfaceName": endpoint.InterfaceName,
+	}
+
+	if endpoint.Netem != nil {
+		netem, err := jsonPayload(endpoint.Netem)
+		if err != nil {
+			return nil, err
+		}
+
+		rendered["netem"] = netem
+	}
+
+	return rendered, nil
 }
 
 // renderNodeProfiles renders one shared topology NodeProfile plus a complete dedicated
